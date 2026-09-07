@@ -18,6 +18,31 @@ if 'deps = [ ":webrtc", "//libwebrtc" ]' not in root_text:
     if 'deps = [ ":webrtc" ]' not in root_text:
         raise SystemExit('WebRTC root build changed; review default target')
     root_build.write_text(root_text.replace('deps = [ ":webrtc" ]', 'deps = [ ":webrtc", "//libwebrtc" ]', 1))
+# This pinned engine revision's call/rtp_config.cc calls
+# std::optional<Rtx>::emplace() with no arguments. Newer libstdc++ (observed
+# on GCC 16) rejects that overload for this aggregate under
+# std::is_constructible_v, even though it is default-constructible via normal
+# initialization — this project deliberately builds against the system
+# libstdc++ (use_custom_libcxx=false) rather than Chromium's bundled libc++,
+# so it inherits whatever stdlib the host toolchain ships. Work around it with
+# plain assignment, which sidesteps emplace()'s overload resolution entirely.
+rtp_config = source / 'call/rtp_config.cc'
+text = rtp_config.read_text()
+old_rtx = 'auto& stream_config_rtx = stream_config.rtx.emplace();'
+if old_rtx in text:
+    rtp_config.write_text(text.replace(
+        old_rtx,
+        'stream_config.rtx = RtpStreamConfig::Rtx();\n'
+        '    auto& stream_config_rtx = *stream_config.rtx;',
+        1))
+# Same story: libwebrtc/include/rtc_types.h uses uint32_t without including
+# <cstdint>, relying on a transitive include that newer, leaner standard
+# library headers no longer guarantee.
+rtc_types = wrapper / 'include/rtc_types.h'
+text = rtc_types.read_text()
+guard = '#ifndef LIB_WEBRTC_RTC_TYPES_HXX\n#define LIB_WEBRTC_RTC_TYPES_HXX\n'
+if guard in text and '#include <cstdint>' not in text:
+    rtc_types.write_text(text.replace(guard, guard + '\n#include <cstdint>\n', 1))
 include = args.ffmpeg_include.resolve()
 majors = {}
 for name in ('avcodec', 'avutil'):
