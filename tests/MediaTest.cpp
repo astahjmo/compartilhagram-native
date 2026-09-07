@@ -165,16 +165,29 @@ private slots:
         }
         // Force a real initialization failure at the next size change.
         // Hardware decoding should continue while encoding falls back.
+        // Encoding tries NVENC before VA-API, so both must fail here to
+        // reach software — otherwise a working NVIDIA GPU papers over the
+        // VA-API device failure this test is inducing.
         auto previous = qgetenv("COMPARTILHAGRAM_VAAPI_DEVICE");
         bool wasSet = qEnvironmentVariableIsSet("COMPARTILHAGRAM_VAAPI_DEVICE");
+        auto previousNvenc = qgetenv("COMPARTILHAGRAM_NVENC_DEVICE");
+        bool nvencWasSet = qEnvironmentVariableIsSet("COMPARTILHAGRAM_NVENC_DEVICE");
         auto restore = qScopeGuard([&] {
           if (wasSet)
             qputenv("COMPARTILHAGRAM_VAAPI_DEVICE", previous);
           else
             qunsetenv("COMPARTILHAGRAM_VAAPI_DEVICE");
+          if (nvencWasSet)
+            qputenv("COMPARTILHAGRAM_NVENC_DEVICE", previousNvenc);
+          else
+            qunsetenv("COMPARTILHAGRAM_NVENC_DEVICE");
         });
         qputenv("COMPARTILHAGRAM_VAAPI_DEVICE",
                 "/dev/dri/compartilhagram-missing-test-device");
+        // CUDA silently accepts a non-numeric device string and falls back to
+        // device 0, unlike VA-API's file-path check — an out-of-range index
+        // is what actually fails device creation.
+        qputenv("COMPARTILHAGRAM_NVENC_DEVICE", "99");
         sourceWidth = 640;
         sourceHeight = 360;
         frames.clear();

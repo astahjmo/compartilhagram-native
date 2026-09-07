@@ -1,5 +1,6 @@
 #include "RtcEngine.h"
 #include <QCoreApplication>
+#include <QDebug>
 #include <QEvent>
 #include <QGuiApplication>
 #include <QJsonDocument>
@@ -9,6 +10,32 @@
 #include <algorithm>
 #include <libyuv/convert.h>
 #include <rtc_audio_device.h>
+
+// Debug-only wire-level tracing: SDP m-line/codec summaries, ICE candidate
+// types, and connection-state transitions, so a session that "shows sharing
+// but the viewer sees nothing" can be diagnosed from stderr instead of
+// guessed at. Enable with COMPARTILHAGRAM_RTC_DEBUG=1.
+static bool rtcDebugEnabled() {
+  static const bool enabled =
+      qEnvironmentVariable("COMPARTILHAGRAM_RTC_DEBUG") == "1";
+  return enabled;
+}
+static QString sdpSummary(const QString &sdp) {
+  QStringList lines;
+  for (const auto &line : sdp.split("\r\n"))
+    if (line.startsWith("m=") || line.startsWith("a=mid:") ||
+        line.startsWith("a=rtpmap:") || line.startsWith("a=fmtp:") ||
+        line.startsWith("a=sendonly") || line.startsWith("a=recvonly") ||
+        line.startsWith("a=sendrecv") || line.startsWith("a=inactive"))
+      lines.append(line.trimmed());
+  return lines.join(" | ");
+}
+static QString candidateSummary(const QString &candidate) {
+  // "... typ host ..." / "... typ srflx ..." / "... typ relay raddr ...".
+  QRegularExpression re(" typ (\\w+)");
+  auto m = re.match(candidate);
+  return m.hasMatch() ? m.captured(1) : QStringLiteral("?");
+}
 
 using namespace libwebrtc;
 static string ws(const QString &s) { return string(s.toUtf8().constData()); }
@@ -58,7 +85,8 @@ struct RtcEngine::Peer : QObject,
   FrameSink sink;
   QList<QJsonObject> candidates;
   bool publishing = false, sfu = false, remoteSet = false, closed = false,
-       gathering = false, descriptionSent = false;
+       gathering = false, descriptionSent = false, answeredAsPublisher = false,
+       renegotiated = false;
   int volume = 100;
   explicit Peer(RtcEngine *e, QString key) : engine(e), id(std::move(key)) {}
   void dispatch(std::function<void(std::shared_ptr<Peer>)> fn) {
@@ -85,7 +113,12 @@ struct RtcEngine::Peer : QObject,
     dispatch([state](auto p) {
       const QStringList names{"new",          "connecting", "connected",
                               "disconnected", "failed",     "closed"};
-      emit p->engine->state(p->id, names.value(int(state), "unknown"));
+      const QString name = names.value(int(state), "unknown");
+      if (rtcDebugEnabled())
+        qDebug().noquote() << "[rtc]" << p->id
+                           << (p->publishing ? "publish" : "receive")
+                           << "connectionState ->" << name;
+      emit p->engine->state(p->id, name);
       if (state == RTCPeerConnectionStateConnected) {
         p->engine->tune(p);
         std::weak_ptr<Peer> weak = p;
@@ -93,6 +126,17 @@ struct RtcEngine::Peer : QObject,
           if (auto p = weak.lock(); p && !p->closed)
             p->engine->tune(p);
         });
+        // CreateAnswer() on a pre-added sendonly transceiver never activates
+        // a real RTP sender in this SDK build (confirmed: correct SDP
+        // direction/track/encoding, yet GetStats() never reports an
+        // outbound-rtp entry at all), while CreateOffer() on the same kind
+        // of transceiver works correctly. A peer that answered while
+        // publishing is renegotiated once, offering ourselves this time, to
+        // route the sender through the working path.
+        if (p->publishing && p->answeredAsPublisher && !p->renegotiated) {
+          p->renegotiated = true;
+          p->engine->offer(p, false);
+        }
       }
     });
   }
@@ -107,6 +151,9 @@ struct RtcEngine::Peer : QObject,
     QJsonObject candidate{{"candidate", qs(c->candidate())},
                           {"sdpMid", qs(c->sdp_mid())},
                           {"sdpMLineIndex", c->sdp_mline_index()}};
+    if (rtcDebugEnabled())
+      qDebug().noquote() << "[rtc]" << id << "local candidate type ="
+                         << candidateSummary(qs(c->candidate()));
     dispatch([candidate](auto p) {
       if (!p->sfu)
         emit p->engine->signal(
@@ -385,8 +432,17 @@ void RtcEngine::tune(const std::shared_ptr<Peer> &p) {
     if (!params)
       continue;
     auto encodings = params->encodings().std_vector();
+    if (rtcDebugEnabled())
+      qDebug() << "[rtc] tune sender kind ="
+               << int(sender->media_type()) << "encodings =" << encodings.size()
+               << (encodings.empty() ? -1 : int(encodings[0]->active()));
     for (auto encoding : encodings) {
       const bool video = sender->media_type() == RTCMediaType::VIDEO;
+      // Some encodings created by this SDK's AddTransceiver come back
+      // inactive by default (mirrors the direction/track defaults also
+      // found wrong here) — force it on or the sender stays silent even
+      // once direction and track are both correct.
+      encoding->set_active(true);
       encoding->set_max_bitrate_bps(video ? bitrate : 128000);
       if (video) {
         encoding->set_min_bitrate_bps(300000);
@@ -412,19 +468,39 @@ void RtcEngine::connectPeer(QString id, bool publishing, bool initiate,
   QJsonArray ice =
       sfu ? QJsonArray{QJsonObject{{"urls", "stun:stun.cloudflare.com:3478"}}}
           : ice_;
-  int index = 0;
+  struct IceEntry {
+    QString url, username, credential;
+  };
+  QList<IceEntry> relays, hosts;
   for (auto value : ice) {
     auto server = value.toObject();
     auto urls = server.value("urls").isArray()
                     ? server.value("urls").toArray()
                     : QJsonArray{server.value("urls")};
     for (auto url : urls) {
-      if (index >= kMaxIceServerSize)
-        break;
-      config.ice_servers[index++] = {ws(url.toString()),
-                                     ws(server.value("username").toString()),
-                                     ws(server.value("credential").toString())};
+      IceEntry entry{url.toString(), server.value("username").toString(),
+                     server.value("credential").toString()};
+      auto &bucket = entry.url.startsWith("turn:", Qt::CaseInsensitive) ||
+                             entry.url.startsWith("turns:", Qt::CaseInsensitive)
+                         ? relays
+                         : hosts;
+      bucket.append(entry);
     }
+  }
+  // The SDK's ice_servers array is fixed at kMaxIceServerSize entries. TURN/TURNS
+  // relays are what let viewers behind restrictive NATs or firewalls connect at
+  // all, so they must never be silently dropped in favor of plain STUN entries
+  // when the combined list overflows that limit.
+  const QList<IceEntry> ordered = relays + hosts;
+  if (ordered.size() > kMaxIceServerSize)
+    qWarning("RtcEngine: %d servidor(es) ICE descartados (limite de %d)",
+             ordered.size() - kMaxIceServerSize, kMaxIceServerSize);
+  int index = 0;
+  for (const auto &entry : ordered) {
+    if (index >= kMaxIceServerSize)
+      break;
+    config.ice_servers[index++] = {ws(entry.url), ws(entry.username),
+                                   ws(entry.credential)};
   }
   auto p = std::make_shared<Peer>(this, id);
   p->publishing = publishing;
@@ -444,19 +520,55 @@ void RtcEngine::connectPeer(QString id, bool publishing, bool initiate,
         RTCRtpTransceiverDirection::kSendOnly,
         vector<string>(std::vector<string>{string("compartilhagram")}), {});
     if (video_)
-      p->pc->AddTransceiver(video_, init);
+      if (auto t = p->pc->AddTransceiver(video_, init)) {
+        t->SetDirectionWithError(RTCRtpTransceiverDirection::kSendOnly);
+        auto sender = t->sender();
+        bool hadTrack = sender && sender->track();
+        if (sender && !hadTrack)
+          sender->set_track(video_);
+        if (rtcDebugEnabled())
+          qDebug() << "[rtc] video sender track after AddTransceiver, present ="
+                   << hadTrack << "senderExists =" << bool(sender);
+      }
     if (audio_)
-      p->pc->AddTransceiver(audio_, init);
+      if (auto t = p->pc->AddTransceiver(audio_, init)) {
+        t->SetDirectionWithError(RTCRtpTransceiverDirection::kSendOnly);
+        auto sender = t->sender();
+        if (sender && !sender->track())
+          sender->set_track(audio_);
+      }
   } else if (!sfu) {
     auto init = RTCRtpTransceiverInit::Create(
         RTCRtpTransceiverDirection::kRecvOnly, {}, {});
-    p->pc->AddTransceiver(RTCMediaType::VIDEO, init);
-    p->pc->AddTransceiver(RTCMediaType::AUDIO, init);
+    if (auto t = p->pc->AddTransceiver(RTCMediaType::VIDEO, init))
+      t->SetDirectionWithError(RTCRtpTransceiverDirection::kRecvOnly);
+    if (auto t = p->pc->AddTransceiver(RTCMediaType::AUDIO, init))
+      t->SetDirectionWithError(RTCRtpTransceiverDirection::kRecvOnly);
   }
   if (initiate)
     offer(p, false);
 }
 
+// Diagnosed on a real cross-network session: CreateAnswer() in this SDK build
+// does not reliably encode the local transceivers' actual, confirmed
+// direction (RTCRtpTransceiver::direction(), verified == kSendOnly via
+// SetDirectionWithError) into the SDP text it returns — it can emit
+// "a=inactive" for every m-line even though the transceivers are sendonly,
+// so ICE/DTLS reaches "connected" but zero RTP ever leaves the process. Every
+// m-section within one of our peer connections shares a single role (all
+// sendonly for a publisher/SFU-publish peer, all recvonly for a
+// viewer/SFU-subscribe peer — see connectPeer), so it is safe to force the
+// direction attribute directly in the local SDP text as a last-resort
+// correction, independent of whatever the SDK itself wrote there.
+static QString forceDirection(const QString &sdp, bool sendonly) {
+  const QString wanted = sendonly ? "a=sendonly" : "a=recvonly";
+  QStringList lines = sdp.split("\r\n");
+  for (auto &line : lines)
+    if (line == "a=sendrecv" || line == "a=sendonly" ||
+        line == "a=recvonly" || line == "a=inactive")
+      line = wanted;
+  return lines.join("\r\n");
+}
 // Match the web client's stereo negotiation and warm-start screen bitrate
 // hints.
 static QString tuneSdp(QString sdp) {
@@ -488,7 +600,8 @@ void RtcEngine::offer(const std::shared_ptr<Peer> &p, bool answer) {
   auto success = [weak](string sdp, string type) {
     if (auto p = weak.lock())
       p->dispatch([sdp = qs(sdp), type = qs(type)](auto p) {
-        p->engine->setLocal(p, tuneSdp(sdp), type);
+        p->engine->setLocal(
+            p, forceDirection(tuneSdp(sdp), p->publishing), type);
       });
   };
   auto failure = [weak](const char *reason) {
@@ -502,6 +615,9 @@ void RtcEngine::offer(const std::shared_ptr<Peer> &p, bool answer) {
 }
 void RtcEngine::setLocal(const std::shared_ptr<Peer> &p, QString sdp,
                          QString type) {
+  if (rtcDebugEnabled())
+    qDebug().noquote() << "[rtc]" << p->id << "local" << type << ":"
+                       << sdpSummary(sdp);
   std::weak_ptr<Peer> weak = p;
   p->pc->SetLocalDescription(
       ws(sdp), ws(type),
@@ -537,6 +653,9 @@ void RtcEngine::signalPeer(QString id, QJsonObject signal) {
   auto type = signal.value("type").toString();
   if (type == "ice") {
     auto c = signal.value("candidate").toObject();
+    if (rtcDebugEnabled())
+      qDebug().noquote() << "[rtc]" << id << "remote candidate type ="
+                         << candidateSummary(c.value("candidate").toString());
     if (!p->remoteSet) {
       if (p->candidates.size() < 256)
         p->candidates.append(c);
@@ -548,6 +667,9 @@ void RtcEngine::signalPeer(QString id, QJsonObject signal) {
   }
   if (type != "offer" && type != "answer")
     return;
+  if (rtcDebugEnabled())
+    qDebug().noquote() << "[rtc]" << id << "remote" << type << ":"
+                       << sdpSummary(signal.value("sdp").toString());
   std::weak_ptr<Peer> weak = p;
   p->pc->SetRemoteDescription(
       ws(signal.value("sdp").toString()), ws(type),
@@ -560,8 +682,18 @@ void RtcEngine::signalPeer(QString id, QJsonObject signal) {
                                   c.value("sdpMLineIndex").toInt(),
                                   ws(c.value("candidate").toString()));
             emit p->engine->remoteDescriptionSet(p->id);
-            if (type == "offer")
+            if (type == "offer") {
+              if (p->publishing)
+                p->answeredAsPublisher = true;
               p->engine->offer(p, true);
+            }
+            // Re-apply bitrate/active encoding parameters once this
+            // negotiation round is actually in effect: the renegotiation
+            // triggered on "connected" (see OnPeerConnectionState) can still
+            // be in flight when the fixed 0ms/2000ms tune() calls run, so an
+            // encoding reset by this round would otherwise stay untouched.
+            if (p->publishing)
+              p->engine->tune(p);
           });
       },
       [weak](const char *error) {

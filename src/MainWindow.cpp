@@ -7,6 +7,7 @@
 #include <QCloseEvent>
 #include <QComboBox>
 #include <QDateTime>
+#include <QDebug>
 #include <QDialogButtonBox>
 #include <QFormLayout>
 #include <QInputDialog>
@@ -20,6 +21,14 @@
 #include <QStatusBar>
 #include <QToolBar>
 #include <QUrlQuery>
+
+// Same wire-level tracing switch as RtcEngine.cpp; also covers signaling
+// events and periodic RTP stats. Enable with COMPARTILHAGRAM_RTC_DEBUG=1.
+static bool rtcDebugEnabled() {
+  static const bool enabled =
+      qEnvironmentVariable("COMPARTILHAGRAM_RTC_DEBUG") == "1";
+  return enabled;
+}
 
 static QString rosterText(const QJsonObject &share) {
   QStringList names;
@@ -364,9 +373,9 @@ MainWindow::MainWindow() {
     if (!watch_.isEmpty())
       rtc_.stats(sfuActive_ ? subscribePeer_
                             : watch_.value("broadcasterId").toString());
-    if (!broadcastPeers_.isEmpty())
-      rtc_.stats(*broadcastPeers_.begin());
-    else if (!publishPeer_.isEmpty())
+    for (const auto &peer : broadcastPeers_)
+      rtc_.stats(peer);
+    if (!publishPeer_.isEmpty())
       rtc_.stats(publishPeer_);
     const auto remaining = own_.value("nextBoostAt").toDouble() -
                            QDateTime::currentMSecsSinceEpoch();
@@ -919,16 +928,24 @@ void MainWindow::onEvent(QString event, QJsonValue payload) {
   } else if (event == "screenshare:viewer_joined") {
     const auto id = o.value("userId").toString();
     if (!own_.isEmpty()) {
+      if (rtcDebugEnabled())
+        qDebug().noquote() << "[rtc] viewer_joined" << id << "initiate ="
+                           << (user_.value("id").toString() < id);
       broadcastPeers_.insert(id);
       rtc_.connectPeer(id, true, user_.value("id").toString() < id);
       QApplication::beep();
     }
   } else if (event == "screenshare:viewer_left") {
     const auto id = o.value("userId").toString();
+    if (rtcDebugEnabled())
+      qDebug().noquote() << "[rtc] viewer_left" << id;
     broadcastPeers_.remove(id);
     rtc_.removePeer(id);
   } else if (event == "rtc:signal" && o.value("channel") == "screenshare") {
     const QString from = o.value("from").toString();
+    if (rtcDebugEnabled())
+      qDebug().noquote() << "[rtc] signal from" << from << "type ="
+                         << o.value("data").toObject().value("type").toString();
     if (sfuActive_ && from == watch_.value("broadcasterId").toString())
       return;
     if (!broadcastPeers_.contains(from) &&
@@ -1118,17 +1135,59 @@ void MainWindow::announce() {
 void MainWindow::reportStats(QString peer, QJsonArray reports) {
   QMap<QString, QJsonObject> byId;
   QString pairId;
+  QJsonObject outboundVideo;
   for (auto value : reports) {
     auto s = value.toObject();
     byId[s.value("id").toString()] = s;
     if (s.value("type") == "transport")
       pairId = s.value("selectedCandidatePairId").toString();
-    if (s.value("type") == "outbound-rtp" && s.value("kind") == "video")
+    if (s.value("type") == "outbound-rtp" && s.value("kind") == "video") {
+      outboundVideo = s;
       stats_->setText(tr("Enviando %1×%2 · %3 fps · limite: %4")
                           .arg(s.value("frameWidth").toInt())
                           .arg(s.value("frameHeight").toInt())
                           .arg(s.value("framesPerSecond").toDouble())
                           .arg(s.value("qualityLimitationReason").toString()));
+    }
+  }
+  if (rtcDebugEnabled() &&
+      (broadcastPeers_.contains(peer) || peer == publishPeer_)) {
+    QStringList allTypes;
+    for (auto value : reports) {
+      auto s = value.toObject();
+      allTypes.append(s.value("type").toString() + ":" +
+                       s.value("kind").toString());
+    }
+    qDebug().noquote() << "[rtc-stats-raw] peer=" << peer
+                       << "reportCount=" << reports.size()
+                       << "outboundVideoEmpty=" << outboundVideo.isEmpty()
+                       << "types=" << allTypes.join(",");
+    // For an outgoing (broadcast) peer: bytes/packets actually leaving the
+    // machine, plus nack/pli/fir counts the remote side reports back. Real
+    // bytesSent with the remote repeatedly asking for keyframes (rising
+    // pliCount/firCount) means the far end cannot decode what we send —
+    // almost always a codec/profile mismatch, not a network problem.
+    const auto pair = byId.value(pairId);
+    const auto local =
+        byId.value(pair.value("localCandidateId").toString());
+    const auto remote =
+        byId.value(pair.value("remoteCandidateId").toString());
+    qDebug().noquote()
+        << QString("[rtc-stats] peer=%1 candidates=%2/%3 codec=%4 "
+                   "bytesSent=%5 packetsSent=%6 framesEncoded=%7 "
+                   "nack=%8 pli=%9 fir=%10")
+               .arg(peer,
+                    local.value("candidateType").toString("?"),
+                    remote.value("candidateType").toString("?"),
+                    byId.value(outboundVideo.value("codecId").toString())
+                        .value("mimeType")
+                        .toString("?"))
+               .arg(outboundVideo.value("bytesSent").toDouble())
+               .arg(outboundVideo.value("packetsSent").toDouble())
+               .arg(outboundVideo.value("framesEncoded").toDouble())
+               .arg(outboundVideo.value("nackCount").toDouble())
+               .arg(outboundVideo.value("pliCount").toDouble())
+               .arg(outboundVideo.value("firCount").toDouble());
   }
   if (peer != watch_.value("broadcasterId").toString() &&
       peer != subscribePeer_)
