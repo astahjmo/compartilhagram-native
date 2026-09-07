@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Compartilhagram
+Comment=Share your screen with Compartilhagram
+Exec=compartilhagram
+Icon=compartilhagram
+Terminal=false
+Categories=Network;AudioVideo;
