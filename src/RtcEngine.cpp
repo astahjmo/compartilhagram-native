@@ -412,19 +412,39 @@ void RtcEngine::connectPeer(QString id, bool publishing, bool initiate,
   QJsonArray ice =
       sfu ? QJsonArray{QJsonObject{{"urls", "stun:stun.cloudflare.com:3478"}}}
           : ice_;
-  int index = 0;
+  struct IceEntry {
+    QString url, username, credential;
+  };
+  QList<IceEntry> relays, hosts;
   for (auto value : ice) {
     auto server = value.toObject();
     auto urls = server.value("urls").isArray()
                     ? server.value("urls").toArray()
                     : QJsonArray{server.value("urls")};
     for (auto url : urls) {
-      if (index >= kMaxIceServerSize)
-        break;
-      config.ice_servers[index++] = {ws(url.toString()),
-                                     ws(server.value("username").toString()),
-                                     ws(server.value("credential").toString())};
+      IceEntry entry{url.toString(), server.value("username").toString(),
+                     server.value("credential").toString()};
+      auto &bucket = entry.url.startsWith("turn:", Qt::CaseInsensitive) ||
+                             entry.url.startsWith("turns:", Qt::CaseInsensitive)
+                         ? relays
+                         : hosts;
+      bucket.append(entry);
     }
+  }
+  // The SDK's ice_servers array is fixed at kMaxIceServerSize entries. TURN/TURNS
+  // relays are what let viewers behind restrictive NATs or firewalls connect at
+  // all, so they must never be silently dropped in favor of plain STUN entries
+  // when the combined list overflows that limit.
+  const QList<IceEntry> ordered = relays + hosts;
+  if (ordered.size() > kMaxIceServerSize)
+    qWarning("RtcEngine: %d servidor(es) ICE descartados (limite de %d)",
+             ordered.size() - kMaxIceServerSize, kMaxIceServerSize);
+  int index = 0;
+  for (const auto &entry : ordered) {
+    if (index >= kMaxIceServerSize)
+      break;
+    config.ice_servers[index++] = {ws(entry.url), ws(entry.username),
+                                   ws(entry.credential)};
   }
   auto p = std::make_shared<Peer>(this, id);
   p->publishing = publishing;
