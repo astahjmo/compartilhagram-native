@@ -179,6 +179,125 @@ class VaapiEncoder final : public VideoEncoder {
   std::map<int64_t, uint32_t> pending_;
 };
 
+// NVIDIA's proprietary driver only exposes H264 *decode* through VA-API (via
+// the third-party nvidia-vaapi-driver shim); encode has no VA-API entrypoint
+// on that stack. FFmpeg's own h264_nvenc, backed by a CUDA hwframe context,
+// is NVIDIA's real hardware encode path — this mirrors VaapiEncoder above,
+// swapping the VA-API device/frame/codec setup for CUDA/NVENC equivalents.
+class NvencEncoder final : public VideoEncoder {
+ public:
+  explicit NvencEncoder(std::shared_ptr<Status> status) : status_(std::move(status)) {}
+  ~NvencEncoder() override { Release(); }
+  int InitEncode(const VideoCodec* codec, const Settings&) override {
+    Release(); width_ = codec->width; height_ = codec->height;
+    bitrate_ = std::max(10000u, codec->startBitrate * 1000); fps_ = std::max(1u, codec->maxFramerate);
+    if (codec->numberOfSimulcastStreams > 1 || (width_ & 1) || (height_ & 1)) return fail("Unsupported simulcast or odd frame dimensions");
+    return open();
+  }
+  int RegisterEncodeCompleteCallback(EncodedImageCallback* callback) override { callback_ = callback; return WEBRTC_VIDEO_CODEC_OK; }
+  int Release() override {
+    avcodec_free_context(&context_); av_buffer_unref(&frames_); av_buffer_unref(&device_); pending_.clear(); return WEBRTC_VIDEO_CODEC_OK;
+  }
+  int Encode(const VideoFrame& frame, const std::vector<VideoFrameType>* types) override {
+    if (paused_) { if (callback_) callback_->OnDroppedFrame(EncodedImageCallback::DropReason::kDroppedByEncoder); return WEBRTC_VIDEO_CODEC_OK; }
+    bool key = !types || std::find(types->begin(), types->end(), VideoFrameType::kVideoFrameKey) != types->end();
+    if (reopen_ || frame.width() != width_ || frame.height() != height_) {
+      width_ = frame.width(); height_ = frame.height(); Release(); if (open() != WEBRTC_VIDEO_CODEC_OK) return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
+      reopen_ = false; key = true;
+    }
+    if (!context_ || !callback_) return fail("Encoder is not initialized");
+    auto i420 = frame.video_frame_buffer()->ToI420();
+    if (!i420) return fail("Unable to convert capture frame to I420");
+    AVFrame* cpu = av_frame_alloc(); AVFrame* gpu = av_frame_alloc();
+    if (!cpu || !gpu) { av_frame_free(&cpu); av_frame_free(&gpu); return fail("Video frame allocation failed"); }
+    cpu->format = AV_PIX_FMT_NV12; cpu->width = width_; cpu->height = height_;
+    int result = av_frame_get_buffer(cpu, 32);
+    if (result >= 0) result = libyuv::I420ToNV12(i420->DataY(), i420->StrideY(), i420->DataU(), i420->StrideU(), i420->DataV(), i420->StrideV(), cpu->data[0], cpu->linesize[0], cpu->data[1], cpu->linesize[1], width_, height_);
+    if (result >= 0) result = av_hwframe_get_buffer(frames_, gpu, 0);
+    if (result >= 0) result = av_hwframe_transfer_data(gpu, cpu, 0);
+    av_frame_free(&cpu);
+    int64_t pts = sequence_++;
+    gpu->pts = pts; gpu->pict_type = key ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
+    if (result >= 0) { pending_[pts] = frame.rtp_timestamp(); result = avcodec_send_frame(context_, gpu); }
+    av_frame_free(&gpu);
+    if (result < 0) return fail("NVENC encode/upload failed: " + error(result));
+    AVPacket* packet = av_packet_alloc();
+    if (!packet) return fail("Encoded packet allocation failed");
+    while ((result = avcodec_receive_packet(context_, packet)) >= 0) {
+      auto timestamp = pending_.find(packet->pts);
+      if (timestamp == pending_.end()) { av_packet_free(&packet); return fail("Encoder returned an unknown frame timestamp"); }
+      EncodedImage image; image.SetEncodedData(EncodedImageBuffer::Create(packet->data, packet->size));
+      image.SetRtpTimestamp(timestamp->second); pending_.erase(timestamp);
+      image._encodedWidth = width_; image._encodedHeight = height_;
+      image._frameType = (packet->flags & AV_PKT_FLAG_KEY) ? VideoFrameType::kVideoFrameKey : VideoFrameType::kVideoFrameDelta;
+      CodecSpecificInfo info{}; info.codecType = kVideoCodecH264;
+      info.codecSpecific.H264.packetization_mode = H264PacketizationMode::NonInterleaved;
+      info.codecSpecific.H264.idr_frame = (packet->flags & AV_PKT_FLAG_KEY) != 0;
+      callback_->OnEncodedImage(image, &info); av_packet_unref(packet);
+    }
+    av_packet_free(&packet);
+    if (pending_.size() > 16) return fail("Hardware encoder stopped returning frames");
+    return result == AVERROR(EAGAIN) || result == AVERROR_EOF ? WEBRTC_VIDEO_CODEC_OK : fail("NVENC output failed: " + error(result));
+  }
+  void SetRates(const RateControlParameters& rates) override {
+    unsigned bitrate = rates.bitrate.get_sum_bps(); paused_ = bitrate == 0;
+    if (paused_) return;
+    unsigned fps = rates.framerate_fps > 0 ? std::clamp(unsigned(rates.framerate_fps), 1u, 60u) : fps_;
+    // NVENC's rate-control parameters are fixed at codec initialization. Apply
+    // decreases immediately; avoid resetting on every small bandwidth increase.
+    if (bitrate < bitrate_ || bitrate > bitrate_ + bitrate_ / 4 || fps != fps_) {
+      bitrate_ = std::max(10000u, bitrate); fps_ = fps; reopen_ = true;
+    }
+  }
+  EncoderInfo GetEncoderInfo() const override {
+    EncoderInfo info; info.implementation_name = "FFmpeg NVENC H264";
+    info.is_hardware_accelerated = true; info.supports_native_handle = false;
+    info.requested_resolution_alignment = 2; info.has_trusted_rate_controller = false;
+    return info;
+  }
+ private:
+  int fail(std::string reason) { status_->reason(std::move(reason)); return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE; }
+  static AVBufferRef* cudaDevice(std::string& reason) {
+    if (const char* disabled = std::getenv("COMPARTILHAGRAM_DISABLE_GPU"); disabled && std::string(disabled) == "1") {
+      reason = "Disabled by COMPARTILHAGRAM_DISABLE_GPU=1"; return nullptr;
+    }
+    const char* selected = std::getenv("COMPARTILHAGRAM_NVENC_DEVICE");
+    AVBufferRef* hw = nullptr;
+    int result = av_hwdevice_ctx_create(&hw, AV_HWDEVICE_TYPE_CUDA, selected && *selected ? selected : nullptr, nullptr, 0);
+    if (result >= 0) return hw;
+    reason = "CUDA device initialization failed: " + error(result);
+    return nullptr;
+  }
+  int open() {
+    std::string reason; device_ = cudaDevice(reason); if (!device_) return fail(reason);
+    const AVCodec* codec = avcodec_find_encoder_by_name("h264_nvenc");
+    if (!codec) return fail("System FFmpeg does not provide h264_nvenc");
+    frames_ = av_hwframe_ctx_alloc(device_); if (!frames_) return fail("CUDA frame pool allocation failed");
+    auto pool = reinterpret_cast<AVHWFramesContext*>(frames_->data);
+    pool->format = AV_PIX_FMT_CUDA; pool->sw_format = AV_PIX_FMT_NV12;
+    pool->width = width_; pool->height = height_; pool->initial_pool_size = 8;
+    int result = av_hwframe_ctx_init(frames_); if (result < 0) return fail("CUDA frame pool failed: " + error(result));
+    context_ = avcodec_alloc_context3(codec); if (!context_) return fail("Encoder allocation failed");
+    context_->width = width_; context_->height = height_; context_->pix_fmt = AV_PIX_FMT_CUDA;
+    context_->time_base = AVRational{1, int(fps_)}; context_->framerate = AVRational{int(fps_), 1};
+    context_->bit_rate = bitrate_; context_->rc_max_rate = bitrate_; context_->rc_buffer_size = bitrate_;
+    context_->gop_size = int(fps_) * 2; context_->max_b_frames = 0;
+    context_->profile = AV_PROFILE_H264_CONSTRAINED_BASELINE;
+    context_->flags |= AV_CODEC_FLAG_LOW_DELAY;
+    context_->hw_frames_ctx = av_buffer_ref(frames_);
+    AVDictionary* options = nullptr;
+    av_dict_set(&options, "rc", "cbr", 0); av_dict_set(&options, "preset", "p4", 0);
+    av_dict_set(&options, "tune", "ull", 0); av_dict_set(&options, "zerolatency", "1", 0);
+    int resultOpen = avcodec_open2(context_, codec, &options); av_dict_free(&options);
+    return resultOpen >= 0 ? WEBRTC_VIDEO_CODEC_OK : fail("System H264 encoder initialization failed: " + error(resultOpen));
+  }
+  std::shared_ptr<Status> status_; EncodedImageCallback* callback_ = nullptr;
+  AVCodecContext* context_ = nullptr; AVBufferRef *device_ = nullptr, *frames_ = nullptr;
+  int width_ = 0, height_ = 0; unsigned bitrate_ = 2000000, fps_ = 30;
+  bool reopen_ = false, paused_ = false; int64_t sequence_ = 0;
+  std::map<int64_t, uint32_t> pending_;
+};
+
 class VaapiDecoder final : public VideoDecoder {
  public:
   explicit VaapiDecoder(std::shared_ptr<Status> status) : status_(std::move(status)) {}
@@ -279,8 +398,13 @@ class EncoderFactory final : public VideoEncoderFactory {
   std::unique_ptr<VideoEncoder> Create(const Environment& env, const SdpVideoFormat& format) override {
     auto software = builtin_->Create(env, format); if (!software) return nullptr;
     auto status = std::make_shared<Status>("encode");
-    if (hardwareFormat(format)) software = CreateVideoEncoderSoftwareFallbackWrapper(env, std::move(software), std::make_unique<VaapiEncoder>(status), false);
-    else status->reason("Negotiated " + format.name + " profile has no configured system GPU encoder; using WebRTC");
+    if (hardwareFormat(format)) {
+      // Try NVENC (NVIDIA's real hardware encode path) first, falling back to
+      // VA-API (AMD/Intel, and NVIDIA decode-only via the vaapi shim never
+      // reaches this encoder) and finally software if neither GPU is present.
+      software = CreateVideoEncoderSoftwareFallbackWrapper(env, std::move(software), std::make_unique<VaapiEncoder>(status), false);
+      software = CreateVideoEncoderSoftwareFallbackWrapper(env, std::move(software), std::make_unique<NvencEncoder>(status), false);
+    } else status->reason("Negotiated " + format.name + " profile has no configured system GPU encoder; using WebRTC");
     return std::make_unique<ObservedEncoder>(std::move(software), status);
   }
  private:
