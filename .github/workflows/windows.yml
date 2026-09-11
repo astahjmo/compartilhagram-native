@@ -1,0 +1,60 @@
+name: Windows
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.3'
+          arch: win64_msvc2022_64
+          cache: true
+      - name: Check out pinned vcpkg
+        uses: actions/checkout@v4
+        with:
+          repository: microsoft/vcpkg
+          ref: f7aed1c7e74fe3a6937c27f72bb68f16a022828a
+          path: build-vcpkg
+      - name: Install libyuv
+        shell: pwsh
+        run: |
+          & ./build-vcpkg/bootstrap-vcpkg.bat -disableMetrics
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & ./build-vcpkg/vcpkg.exe install libyuv:x64-windows-static-md --overlay-triplets=packaging/windows
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Configure
+        shell: pwsh
+        run: >-
+          cmake -S . -B build-windows -A x64
+          -DCMAKE_TOOLCHAIN_FILE="$pwd/build-vcpkg/scripts/buildsystems/vcpkg.cmake"
+          -DVCPKG_TARGET_TRIPLET=x64-windows-static-md
+          -DVCPKG_OVERLAY_TRIPLETS="$pwd/packaging/windows"
+          -DBUILD_TESTING=ON
+      - name: Build
+        run: cmake --build build-windows --config Release --parallel 4
+      - name: Test
+        run: ctest --test-dir build-windows -C Release --output-on-failure
+      - name: Package
+        shell: pwsh
+        run: |
+          cmake --install build-windows --config Release --prefix dist-windows
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item build-vcpkg/installed/x64-windows-static-md/share/libyuv/copyright dist-windows/share/compartilhagram/libyuv-LICENSE
+          Copy-Item build-vcpkg/installed/x64-windows-static-md/share/libjpeg-turbo/copyright dist-windows/share/compartilhagram/libjpeg-turbo-LICENSE
+          Copy-Item README.md dist-windows/README.md
+          Compress-Archive -Path dist-windows/* -DestinationPath Compartilhagram-windows-x64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Compartilhagram-windows-x64
+          path: Compartilhagram-windows-x64.zip

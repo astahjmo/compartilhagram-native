@@ -47,7 +47,7 @@ QNetworkRequest ServerClient::request(const QUrl &url) const {
   // embedded.
   req.setRawHeader(
       "User-Agent",
-      "Mozilla/5.0 (compatible; Compartilhagram-Native/0.1; Linux)");
+      "Mozilla/5.0 (compatible; Compartilhagram-Native/0.1)");
   req.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
                    QNetworkRequest::ManualRedirectPolicy);
   req.setAttribute(QNetworkRequest::CookieLoadControlAttribute,

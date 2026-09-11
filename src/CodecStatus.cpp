@@ -4,13 +4,22 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QSet>
+#ifdef Q_OS_WIN
+#include <windows.h>
+#else
 #include <dlfcn.h>
+#endif
 
 namespace {
 using ReadStatus = size_t (*)(char *, size_t);
 ReadStatus reader() {
+#ifdef Q_OS_WIN
+  static auto function = reinterpret_cast<ReadStatus>(GetProcAddress(
+      GetModuleHandleW(L"libwebrtc.dll"), "CompartilhagramCodecStatus"));
+#else
   static auto function = reinterpret_cast<ReadStatus>(
       dlsym(RTLD_DEFAULT, "CompartilhagramCodecStatus"));
+#endif
   return function;
 }
 } // namespace
@@ -33,6 +42,7 @@ QString CodecStatus::text() {
   QString reason;
   if (qEnvironmentVariable("COMPARTILHAGRAM_DISABLE_GPU") == "1")
     reason = "Disabled by COMPARTILHAGRAM_DISABLE_GPU=1";
+#ifndef Q_OS_WIN
   else if (auto chosen = qEnvironmentVariable("COMPARTILHAGRAM_VAAPI_DEVICE");
            !chosen.isEmpty()) {
     if (!QFileInfo(chosen).isReadable() || !QFileInfo(chosen).isWritable())
@@ -41,6 +51,7 @@ QString CodecStatus::text() {
                  .entryList({"renderD*"}, QDir::Files | QDir::System)
                  .isEmpty())
     reason = "No GPU render device (/dev/dri/renderD*) is available";
+#endif
   return describe(available(), reason, streams());
 }
 QString CodecStatus::describe(bool adapterAvailable,

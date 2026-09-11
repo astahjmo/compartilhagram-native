@@ -1,5 +1,7 @@
 #include "CodecStatus.h"
+#ifndef Q_OS_WIN
 #include "PortalCapture.h"
+#endif
 #include "RtcEngine.h"
 #include <QScopeGuard>
 #include <QSignalSpy>
@@ -26,6 +28,7 @@ private slots:
     QVERIFY(text.contains("reason: Unsupported codec"));
   }
   void portalPixels() {
+#ifndef Q_OS_WIN
     QCOMPARE(PortalCapture::sourceMask(false), 1u);
     QCOMPARE(PortalCapture::sourceMask(true), 2u);
     const uint8_t rgba[] = {255, 0, 0, 255, 0, 0, 255, 255, 0, 0, 0, 0};
@@ -41,6 +44,7 @@ private slots:
     QVERIFY(PortalCapture::copyFrame(rgba, sizeof(rgba), 2, 1, 12,
                                      SPA_VIDEO_FORMAT_I420)
                 .isNull());
+#endif
     QImage odd(17, 13, QImage::Format_ARGB32);
     odd.fill(Qt::red);
     auto frame = RtcEngine::imageFrame(odd);

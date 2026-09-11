@@ -267,6 +267,7 @@ QList<RtcEngine::Source> RtcEngine::sources() {
 bool RtcEngine::capture(const Source &source, QJsonObject quality) {
   if (!factory_)
     return false;
+#ifndef Q_OS_WIN
   pendingPortal_.reset();
   if (source.portalType) {
     auto videoSource = factory_->CreateCustomVideoSource(
@@ -300,6 +301,10 @@ bool RtcEngine::capture(const Source &source, QJsonObject quality) {
     capture->start(source.portalType == 2, quality.value("fps").toInt(30));
     return true;
   }
+#else
+  if (source.portalType)
+    return false;
+#endif
   if (!source.media)
     return false;
   auto capturer =
@@ -318,7 +323,9 @@ bool RtcEngine::capture(const Source &source, QJsonObject quality) {
     capturer->DeRegisterDesktopCapturerObserver();
     return false;
   }
+#ifndef Q_OS_WIN
   portal_.reset();
+#endif
   installVideo(videoSource, video, capturer, quality);
   return true;
 }
@@ -376,8 +383,10 @@ scoped_refptr<RTCVideoFrame> RtcEngine::imageFrame(const QImage &image) {
   return RTCVideoFrame::Create(w, h, yp, w, up, uvStride, vp, uvStride);
 }
 void RtcEngine::stopCapture() {
+#ifndef Q_OS_WIN
   pendingPortal_.reset();
   portal_.reset();
+#endif
   systemAudio_.stop();
   if (video_)
     video_->RemoveRenderer(&preview_);
@@ -405,8 +414,10 @@ void RtcEngine::OnError(scoped_refptr<RTCDesktopCapturer> capture) {
 void RtcEngine::setQuality(QJsonObject quality) {
   const auto oldFps = quality_.value("fps").toInt(30);
   quality_ = quality;
+#ifndef Q_OS_WIN
   if (portal_)
     portal_->setFps(quality.value("fps").toInt(30));
+#endif
   if (capturer_ && oldFps != quality_.value("fps").toInt(30)) {
     capturer_->Stop();
     capturer_->Start(quality_.value("fps").toInt(30));

@@ -5,7 +5,9 @@
 #include <QTimer>
 #include <map>
 #include <memory>
+#ifndef Q_OS_WIN
 #include <pulse/pulseaudio.h>
+#endif
 #include <rtc_audio_source.h>
 
 struct AudioSelection {
@@ -38,6 +40,14 @@ signals:
   void samples(QByteArray pcm);
 
 private:
+  libwebrtc::scoped_refptr<libwebrtc::RTCAudioSource> source_;
+  AudioSelection selection_;
+  int generation_ = 0;
+#ifdef Q_OS_WIN
+  struct WindowsState;
+  std::unique_ptr<WindowsState> windows_;
+  void launch();
+#else
   struct Input;
   struct Application {
     uint32_t index, sink;
@@ -55,12 +65,10 @@ private:
   static void read(pa_stream *, size_t, void *);
   pa_threaded_mainloop *loop_ = nullptr;
   pa_context *context_ = nullptr;
-  libwebrtc::scoped_refptr<libwebrtc::RTCAudioSource> source_;
-  AudioSelection selection_;
   std::map<uint32_t, std::unique_ptr<Input>> streams_;
   std::map<uint32_t, QString> monitors_;
   std::map<uint32_t, Application> applications_;
   bool refreshing_ = false, refreshAgain_ = false;
   QTimer mixTimer_;
-  int generation_ = 0;
+#endif
 };

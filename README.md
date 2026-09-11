@@ -5,9 +5,9 @@ Uses **standalone Google libwebrtc**, through the `webrtc-sdk/libwebrtc` C++ wra
 There is no Qt WebEngine, Chromium UI, JavaScript runtime, or embedded web page.
 Only Compartilhagram is implemented; the other games, pages, and site navigation are excluded.
 
-## Build and run
+## Linux build and run
 
-The initial target is **Linux x86_64**. Requirements: a C++20 compiler, CMake 3.24+,
+The Linux target is **Linux x86_64**. Requirements: a C++20 compiler, CMake 3.24+,
 Qt6 Widgets/Network/DBus/Test development packages, pkg-config, PulseAudio, PipeWire,
 and libyuv development headers (`libpulse-dev libpipewire-0.3-dev libyuv-dev` on Debian).
 Qt Multimedia and Qt WebSockets are not required.
@@ -37,6 +37,100 @@ cmake --install compartilhagram-native-app/build --prefix "$PWD/compartilhagram-
 ```
 
 Qt and the system libraries reported by `ldd` still need to be installed on the target machine.
+
+## Windows build and distribution
+
+The Windows target is **Windows 11 x64**, with Visual Studio 2022 (Desktop
+Development with C++), Windows SDK **10.0.22000.0 or newer**, CMake 3.24+, and
+**Qt 6.8.3 MSVC 2022 64-bit**. Windows 10, ARM64 and MinGW are not supported by
+this build configuration. Use Release or RelWithDebInfo; the pinned WebRTC C++
+SDK is not compatible with the MSVC Debug runtime/STL.
+
+Screen and window capture use the WebRTC SDK's native desktop capturer. Audio
+uses WASAPI process loopback, independently of the selected window, at 48 kHz
+stereo. No microphone is opened. The Windows process-loopback API includes child
+processes: browsers and embedded helper processes can therefore share one audio
+choice. Overlapping capture trees are grouped to avoid duplication; the app's
+own received audio is excluded. Choices use executable paths and discovery
+refreshes once per second. If an excluded executable becomes part of another
+listed application's tree, that entire tree is omitted at the next refresh.
+Inaccessible/protected processes are not listed.
+Capture errors stop that audio capture and are reported; there is no fallback
+to recording the entire output device. Audio sessions opened after capture
+starts are discovered automatically.
+
+The Windows build uses the official SDK codecs. The custom Linux VA-API/NVENC
+adapter and its GPU telemetry are **not ported to Windows**; this build does not
+promise hardware acceleration there. Standard video encoding remains available.
+
+From a Developer PowerShell for VS 2022, install libyuv with vcpkg (the custom
+triplet links its libraries statically and uses the release DLL CRT). The
+workflow in `.github/workflows/windows.yml` pins the vcpkg revision; local builds
+can use the same revision for reproducibility:
+
+```powershell
+git clone https://github.com/microsoft/vcpkg.git build-vcpkg
+# See the workflow's vcpkg checkout ref for the pinned commit.
+./build-vcpkg/bootstrap-vcpkg.bat -disableMetrics
+./build-vcpkg/vcpkg.exe install libyuv:x64-windows-static-md --overlay-triplets=packaging/windows
+
+# Replace this path with your Qt installation.
+$qtPrefix = "C:/Qt/6.8.3/msvc2022_64"
+$env:PATH = "$qtPrefix/bin;$env:PATH"
+cmake -S . -B build-windows -A x64 `
+  -DCMAKE_PREFIX_PATH="$qtPrefix" `
+  -DCMAKE_TOOLCHAIN_FILE="$pwd/build-vcpkg/scripts/buildsystems/vcpkg.cmake" `
+  -DVCPKG_TARGET_TRIPLET=x64-windows-static-md `
+  -DVCPKG_OVERLAY_TRIPLETS="$pwd/packaging/windows"
+cmake --build build-windows --config Release --parallel 4
+ctest --test-dir build-windows -C Release --output-on-failure
+./build-windows/Release/compartilhagram.exe
+```
+
+CMake downloads `libwebrtc-win-x64-release.zip` from the same pinned
+`libwebrtc.m144.7559.09` release as Linux, verifying SHA-256
+`55bde16897e83f3bcaf001ba72c2189e96197193c3160a5eeb154f769fd6551d`.
+Offline builds can set `-DWEBRTC_ROOT=C:/path/to/libwebrtc-x64-release
+-DDOWNLOAD_WEBRTC=OFF`. That directory must contain `include/libwebrtc.h`,
+`lib/libwebrtc.dll`, `lib/libwebrtc.dll.lib` and `LICENSE`.
+
+To distribute, install into a clean folder. CMake copies the WebRTC DLL and runs
+Qt's `windeployqt` to collect Qt plugins, libraries, and compiler runtime:
+
+```powershell
+cmake --install build-windows --config Release --prefix dist-windows
+Copy-Item build-vcpkg/installed/x64-windows-static-md/share/libyuv/copyright dist-windows/share/compartilhagram/libyuv-LICENSE
+Copy-Item build-vcpkg/installed/x64-windows-static-md/share/libjpeg-turbo/copyright dist-windows/share/compartilhagram/libjpeg-turbo-LICENSE
+Copy-Item README.md dist-windows/README.md
+Compress-Archive -Path dist-windows/* -DestinationPath Compartilhagram-windows-x64.zip
+```
+
+Extract the **whole ZIP** and launch `bin/compartilhagram.exe`. Copying the EXE
+alone is insufficient. The Windows workflow builds, runs the shared tests and
+uploads this ZIP as an artifact; adding the workflow locally does not run it.
+
+### Windows validation
+
+Shared tests cover protocol, UI, WebRTC encode/decode loopback, audio mixing,
+selection and process-tree grouping. Linux portal/PipeWire integration tests
+remain Linux-only. Native Windows audio integration is opt-in because hosted
+CI runners normally have no usable audio output device. On Windows 11 with a
+working output device, run the following (it plays two short test tones):
+
+```powershell
+$env:COMPARTILHAGRAM_TEST_WINDOWS_AUDIO = "1"
+./build-windows/Release/audio_test.exe windowsApplicationCapture
+Remove-Item Env:COMPARTILHAGRAM_TEST_WINDOWS_AUDIO
+```
+
+The test checks discovery, inclusion, exclusion, mixed audio and stopping using
+two separate WASAPI playback processes. Before releasing, also test screen and
+window sharing, source switching, application exit/restart, multiple monitors
+and DPI settings, system tray behavior, and a Windows-to-Linux call on a real
+Windows desktop. Verify the extracted package on a machine without Qt installed.
+
+References: [Microsoft process-loopback API](https://learn.microsoft.com/en-us/samples/microsoft/windows-classic-samples/applicationloopbackaudio-sample/),
+[Qt Windows deployment](https://doc.qt.io/qt-6/windows-deployment.html).
 
 ## Single-file Linux build
 
@@ -227,7 +321,7 @@ announcements happen only when you choose a channel, or start with an explicit i
 
 Native differences: there is no Chrome-tab picker or tab-only audio capture, no restoration
 of browser sessionStorage/PiP state, and no operating-system URL-handler registration. Paste
-share/invite links inside the app. Windows/macOS builds are not configured in this first version.
+share/invite links inside the app. Windows x64 has a separate native capture/audio backend (see the Windows build section). macOS is not configured.
 
 ## Verification
 

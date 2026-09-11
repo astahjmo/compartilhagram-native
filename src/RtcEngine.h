@@ -1,5 +1,8 @@
 #pragma once
+#include <QtGlobal>
+#ifndef Q_OS_WIN
 #include "PortalCapture.h"
+#endif
 #include "SystemAudio.h"
 #include <QImage>
 #include <QJsonArray>
@@ -109,7 +112,9 @@ private:
   FrameSink preview_;
   SystemAudio systemAudio_;
   AudioSelection audioSelection_;
+#ifndef Q_OS_WIN
   std::unique_ptr<PortalCapture> portal_, pendingPortal_;
+#endif
   QJsonArray ice_;
   QJsonObject quality_;
   std::map<QString, std::shared_ptr<Peer>> peers_;

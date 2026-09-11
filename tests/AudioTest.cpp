@@ -1,4 +1,5 @@
 #include "SystemAudio.h"
+#include "AudioProcessTree.h"
 #include <QFile>
 #include <QProcess>
 #include <QSignalSpy>
@@ -19,6 +20,30 @@ public:
 class AudioTest : public QObject {
   Q_OBJECT
 private slots:
+  void windowsProcessTrees() {
+    using namespace AudioProcessTree;
+    Processes tree{{1, {0, "shell", 1}}, {2, {1, "browser", 2}},
+                   {3, {2, "browser", 3}}, {4, {2, "helper", 4}},
+                   {5, {1, "chat", 5}}, {6, {1, "self", 6}},
+                   {7, {6, "self", 7}}};
+    // Multiple browser processes and an embedded helper are a single choice.
+    QCOMPARE(roots(tree, {2, 3, 4, 5, 6, 7}, 6), (QSet<quint32>{2, 5}));
+    // The silent browser parent is still the capture root for its audio child.
+    QCOMPARE(roots(tree, {3, 5}, 6), (QSet<quint32>{2, 5}));
+    // A shell containing this app cannot capture its own received audio.
+    QVERIFY(!roots(tree, {1, 5, 6}, 6).contains(1));
+    // Preserve an earlier exclusion if a child becomes grouped under a parent.
+    QVERIFY(containsExcludedApplication(tree, 2, {"helper"}));
+    QVERIFY(!containsExcludedApplication(tree, 5, {"helper"}));
+    // Parent PID 2 was reused after child 3 started: do not capture its tree.
+    tree[2].created = 10;
+    QCOMPARE(AudioProcessTree::parent(tree, 3), 0u);
+    QCOMPARE(roots(tree, {3, 5}, 6), (QSet<quint32>{3, 5}));
+    // Unknown/inaccessible processes and cycles fail closed.
+    QCOMPARE(roots(tree, {99}, 6), QSet<quint32>{});
+    tree[2].parent = 3;
+    QVERIFY(!contains(tree, 2, 3));
+  }
   void selectionPolicy() {
     AudioSelection s;
     QVERIFY(!s.accepts("browser"));
@@ -50,7 +75,84 @@ private slots:
     QCOMPARE(qFromLittleEndian<int16_t>(clipped.constData()), -32768);
     QCOMPARE(SystemAudio::mixPcm({}), QByteArray(1920, '\0'));
   }
+#ifdef Q_OS_WIN
+  void windowsApplicationCapture() {
+    if (qEnvironmentVariable("COMPARTILHAGRAM_TEST_WINDOWS_AUDIO") != "1")
+      QSKIP("Set COMPARTILHAGRAM_TEST_WINDOWS_AUDIO=1 on Windows 11 with an audio output device");
+    QTemporaryDir directory;
+    QVERIFY(directory.isValid());
+    const auto fixture = QCoreApplication::applicationDirPath() + "/windows_audio_tone.exe";
+    const auto firstPath = directory.path() + "/first.exe";
+    const auto secondPath = directory.path() + "/second.exe";
+    QVERIFY(QFile::copy(fixture, firstPath));
+    QVERIFY(QFile::copy(fixture, secondPath));
+    struct Player : QProcess {
+      ~Player() { if (state() != NotRunning) { kill(); waitForFinished(); } }
+    } first, second;
+    first.start(firstPath, {"500"});
+    second.start(secondPath, {"1500"});
+    QVERIFY(first.waitForStarted());
+    QVERIFY(second.waitForStarted());
+    QByteArray firstOutput, secondOutput;
+    QTRY_VERIFY_WITH_TIMEOUT((firstOutput += first.readAllStandardOutput()).contains("READY"), 5000);
+    QTRY_VERIFY_WITH_TIMEOUT((secondOutput += second.readAllStandardOutput()).contains("READY"), 5000);
+    SystemAudio capture;
+    QSignalSpy errors(&capture, &SystemAudio::failed),
+        listings(&capture, &SystemAudio::applicationsChanged);
+    capture.discover();
+    QString firstKey, secondKey;
+    auto discovered = [&] {
+      if (listings.isEmpty()) return false;
+      for (auto app : qvariant_cast<QJsonArray>(listings.last().first())) {
+        auto key = app.toObject().value("key").toString();
+        if (key.endsWith("first.exe")) firstKey = key;
+        if (key.endsWith("second.exe")) secondKey = key;
+      }
+      return !firstKey.isEmpty() && !secondKey.isEmpty();
+    };
+    QTRY_VERIFY_WITH_TIMEOUT(discovered(), 5000);
+    libwebrtc::scoped_refptr<libwebrtc::RTCAudioSource> source =
+        new libwebrtc::RefCountedObject<TestAudioSource>();
+    QByteArray recording;
+    connect(&capture, &SystemAudio::samples, this,
+            [&](QByteArray pcm) { recording.append(pcm); });
+    auto amplitude = [&](int frequency) {
+      double energy = 0;
+      const auto blocks = recording.size() / 1920;
+      for (qsizetype block = 0; block < blocks; ++block) {
+        double re = 0, im = 0;
+        for (int i = 0; i < 480; ++i) {
+          const double value = qFromLittleEndian<int16_t>(recording.constData() + block * 1920 + i * 4);
+          const double angle = 2 * 3.141592653589793 * frequency * i / 48000;
+          re += value * std::cos(angle);
+          im += value * std::sin(angle);
+        }
+        energy += std::hypot(re, im) / 240;
+      }
+      return blocks ? energy / blocks : 0.;
+    };
+    for (auto mode : {AudioSelection::Include, AudioSelection::Exclude, AudioSelection::All}) {
+      capture.start(source, {mode, {mode == AudioSelection::Include ? firstKey : secondKey}});
+      QTest::qWait(600);
+      recording.clear();
+      QTest::qWait(1000);
+      QVERIFY2(errors.isEmpty(), "Windows process loopback capture failed");
+      QVERIFY2(amplitude(500) > 1000, "Selected process audio missing");
+      if (mode == AudioSelection::All)
+        QVERIFY2(amplitude(1500) > 1000, "Second process audio missing");
+      else
+        QVERIFY2(amplitude(1500) < 100, "Excluded process leaked into capture");
+    }
+    capture.start(source, {AudioSelection::None, {}});
+    recording.clear();
+    QTest::qWait(100);
+    QVERIFY(recording.isEmpty());
+  }
+#endif
   void isolatedApplicationCapture() {
+#ifdef Q_OS_WIN
+    QSKIP("Linux PipeWire integration test; run windowsApplicationCapture on Windows");
+#else
     for (const auto &tool :
          {"pipewire", "pipewire-pulse", "wireplumber", "paplay", "pactl"})
       if (QStandardPaths::findExecutable(tool).isEmpty())
@@ -193,6 +295,7 @@ private slots:
     QTest::qWait(100);
     QVERIFY(recording.isEmpty());
     capture.stop();
+#endif
   }
 };
 QTEST_GUILESS_MAIN(AudioTest)

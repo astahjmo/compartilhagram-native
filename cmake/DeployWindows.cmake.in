@@ -1,0 +1,7 @@
+execute_process(
+  COMMAND "@WINDEPLOYQT_EXECUTABLE@" --release --compiler-runtime
+    "${CMAKE_INSTALL_PREFIX}/bin/compartilhagram.exe"
+  RESULT_VARIABLE result)
+if(NOT result EQUAL 0)
+  message(FATAL_ERROR "windeployqt failed: ${result}")
+endif()

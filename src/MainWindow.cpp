@@ -559,6 +559,11 @@ void MainWindow::configure(bool update) {
       tr("Reproduza áudio no aplicativo para ele aparecer aqui.\nEscolha o "
          "aplicativo correspondente à janela; essa associação não é "
          "automática. Navegadores podem agrupar várias abas."));
+#ifdef Q_OS_WIN
+  audioHint->setText(audioHint->text() +
+      tr("\nNo Windows, a seleção inclui os subprocessos do aplicativo. "
+         "Aplicativos na mesma árvore de processos aparecem agrupados."));
+#endif
   audioHint->setWordWrap(true);
   SystemAudio discovery;
   connect(&discovery, &SystemAudio::applicationsChanged, &dialog,
