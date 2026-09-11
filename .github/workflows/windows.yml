@@ -64,9 +64,11 @@ jobs:
         run: |
           $env:QT_QPA_PLATFORM = "offscreen"
           $env:COMPARTILHAGRAM_DISABLE_GPU = "1"
+          $env:COMPARTILHAGRAM_RTC_DEBUG = "1"
+          $env:QT_FORCE_STDERR_LOGGING = "1"
           $exe = (Get-ChildItem -Path build-windows -Recurse -Filter media_test.exe | Select-Object -First 1).FullName
-          Write-Host "Running: $exe"
-          & $exe -v2 -o media_test_results.txt,txt
+          Write-Host "Running: $exe nativeEncodeDecode (only that sub-test, with RTC tracing)"
+          & $exe nativeEncodeDecode -v2 -o media_test_results.txt,txt 2>&1 | Tee-Object -FilePath media_test_console.txt
           Write-Host "Exit code: $LASTEXITCODE"
           Write-Host "----- media_test_results.txt -----"
           Get-Content media_test_results.txt -ErrorAction SilentlyContinue
@@ -74,7 +76,9 @@ jobs:
         if: always()
         with:
           name: media-test-diagnostics
-          path: media_test_results.txt
+          path: |
+            media_test_results.txt
+            media_test_console.txt
           if-no-files-found: ignore
       - name: Test
         run: ctest --test-dir build-windows -C Release --output-on-failure
