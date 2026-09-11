@@ -1,6 +1,7 @@
 #include "RtcEngine.h"
 #include <QCoreApplication>
 #include <QDebug>
+#include <QElapsedTimer>
 #include <QEvent>
 #include <QGuiApplication>
 #include <QJsonDocument>
@@ -191,10 +192,19 @@ struct RtcEngine::Peer : QObject,
 };
 
 RtcEngine::RtcEngine(QObject *parent) : QObject(parent) {
-  if (LibWebRTC::Initialize())
+  QElapsedTimer initTiming;
+  initTiming.start();
+  const bool libInitOk = LibWebRTC::Initialize();
+  qWarning() << "[rtc-timing] LibWebRTC::Initialize() ->" << libInitOk
+             << "after" << initTiming.elapsed() << "ms";
+  if (libInitOk)
     factory_ = LibWebRTC::CreateRTCPeerConnectionFactory();
+  qWarning() << "[rtc-timing] CreateRTCPeerConnectionFactory() ->"
+             << bool(factory_) << "after" << initTiming.elapsed() << "ms";
   if (factory_ && !factory_->Initialize())
     factory_ = nullptr;
+  qWarning() << "[rtc-timing] factory_->Initialize() done, factory ="
+             << bool(factory_) << "after" << initTiming.elapsed() << "ms";
   connect(&preview_, &FrameSink::frame, this, [this](QImage image) {
     if (!video_)
       return;
