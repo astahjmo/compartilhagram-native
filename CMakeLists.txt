@@ -84,7 +84,10 @@ if(BUILD_TESTING)
   add_executable(media_test tests/MediaTest.cpp)
   target_link_libraries(media_test PRIVATE compartilhagram_media Qt6::Test)
   add_test(NAME media COMMAND media_test)
-  set_tests_properties(media PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen;COMPARTILHAGRAM_DISABLE_GPU=1" TIMEOUT 40)
+  # DIAGNOSTIC: temporarily raised to determine whether the Windows CI hang
+  # in this test is a genuine deadlock or just much slower ICE gathering
+  # there than on Linux. Restore to 40 once the real cause is known.
+  set_tests_properties(media PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen;COMPARTILHAGRAM_DISABLE_GPU=1" TIMEOUT 300)
   add_executable(audio_test tests/AudioTest.cpp)
   target_link_libraries(audio_test PRIVATE compartilhagram_media Qt6::Test)
   if(WIN32)
