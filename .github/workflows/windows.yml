@@ -10,6 +10,15 @@ jobs:
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
+      # A crashing test would otherwise wait forever for a Windows Error
+      # Reporting dialog nobody on a headless runner can click — indistinguishable
+      # from a genuine hang. Disabling the UI turns that into a normal failure.
+      - name: Disable Windows Error Reporting UI
+        shell: pwsh
+        run: |
+          New-Item -Path "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting" -Force | Out-Null
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting" -Name DontShowUI -Value 1 -Force
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting" -Name Disabled -Value 1 -Force
       - name: Set up MSVC environment
         uses: ilammy/msvc-dev-cmd@v1
         with:
@@ -43,6 +52,30 @@ jobs:
           -DBUILD_TESTING=ON
       - name: Build
         run: cmake --build build-windows --config Release --parallel 4
+      # DIAGNOSTIC: run media_test.exe directly with Qt's own file-backed test
+      # logger (-o ...,txt), which flushes each result as it happens — unlike
+      # stdout capture, this survives an abrupt crash so we can see exactly
+      # which sub-test fails/crashes instead of just "media: Failed/Timeout"
+      # with zero detail, which is what ctest alone has been showing.
+      - name: Diagnose media test directly
+        if: always()
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $env:QT_QPA_PLATFORM = "offscreen"
+          $env:COMPARTILHAGRAM_DISABLE_GPU = "1"
+          $exe = (Get-ChildItem -Path build-windows -Recurse -Filter media_test.exe | Select-Object -First 1).FullName
+          Write-Host "Running: $exe"
+          & $exe -v2 -o media_test_results.txt,txt
+          Write-Host "Exit code: $LASTEXITCODE"
+          Write-Host "----- media_test_results.txt -----"
+          Get-Content media_test_results.txt -ErrorAction SilentlyContinue
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: media-test-diagnostics
+          path: media_test_results.txt
+          if-no-files-found: ignore
       - name: Test
         run: ctest --test-dir build-windows -C Release --output-on-failure
       - name: Package
