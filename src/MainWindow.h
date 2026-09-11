@@ -29,7 +29,11 @@ class MainWindow : public QMainWindow {
 public:
   MainWindow();
   ~MainWindow() override;
-  void promptSession();
+  // tryBrowser: silently attempt the default-browser session cookie first
+  // (only sensible for the very first prompt of a run); "Trocar sessão" and
+  // forced re-logins pass false so a deliberate action always shows the
+  // manual dialog instead of instantly re-authenticating the same account.
+  void promptSession(bool tryBrowser);
 
 protected:
   void closeEvent(QCloseEvent *) override;

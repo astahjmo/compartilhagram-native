@@ -111,7 +111,7 @@ private slots:
       dialog->grab().save("session-preview.png");
       dialog->reject();
     });
-    window.promptSession();
+    window.promptSession(false); // avoid touching real browser profiles/opening a browser in CI
     QVERIFY(sawPrompt);
   }
 };

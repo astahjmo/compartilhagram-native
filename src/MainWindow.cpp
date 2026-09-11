@@ -1,4 +1,5 @@
 #include "MainWindow.h"
+#include "BrowserSession.h"
 #include "CodecStatus.h"
 #include <QApplication>
 #include <QBuffer>
@@ -8,6 +9,7 @@
 #include <QComboBox>
 #include <QDateTime>
 #include <QDebug>
+#include <QDesktopServices>
 #include <QDialogButtonBox>
 #include <QFormLayout>
 #include <QInputDialog>
@@ -159,7 +161,8 @@ MainWindow::MainWindow() {
   auto link = bar->addAction(tr("Abrir link / convite"));
   auto session = bar->addAction(tr("Trocar sessão"));
   connect(link, &QAction::triggered, this, &MainWindow::openLink);
-  connect(session, &QAction::triggered, this, &MainWindow::promptSession);
+  connect(session, &QAction::triggered, this,
+          [this] { promptSession(false); });
   connect(start_, &QPushButton::clicked, this, [this] { configure(); });
   connect(stop, &QPushButton::clicked, this, &MainWindow::stopBroadcast);
   connect(source, &QPushButton::clicked, this, [this] { chooseSource(false); });
@@ -391,14 +394,17 @@ MainWindow::~MainWindow() {
 void MainWindow::message(const QString &text) {
   statusBar()->showMessage(text, 20000);
 }
-void MainWindow::promptSession() {
+void MainWindow::promptSession(bool tryBrowser) {
   QDialog dialog(this);
   dialog.setWindowTitle(tr("Entrar no Compartilhagram"));
   auto layout = new QVBoxLayout(&dialog);
-  auto description =
-      new QLabel(tr("Cole sua sessão Better Auth (PHP-session).\nEla será "
-                    "usada somente nesta execução, sem salvar em disco."));
-  layout->addWidget(description);
+  auto status = new QLabel(tryBrowser
+                               ? tr("Procurando sua sessão no navegador…")
+                               : QString());
+  status->setTextFormat(Qt::PlainText);
+  status->setWordWrap(true);
+  layout->addWidget(status);
+  layout->addWidget(new QLabel(tr("Ou cole a sessão manualmente:")));
   auto input = new QLineEdit;
   input->setEchoMode(QLineEdit::Password);
   input->setPlaceholderText(tr("Valor de better-auth.session_token"));
@@ -410,18 +416,56 @@ void MainWindow::promptSession() {
   auto buttons =
       new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
   layout->addWidget(buttons);
-  connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
-  connect(buttons, &QDialogButtonBox::accepted, &dialog, [&, this] {
-    if (input->text().isEmpty())
-      return;
+  // Keeps retrying the browser-cookie lookup in the background after we've
+  // opened the site for the user, so logging in there brings this dialog
+  // straight through without any extra click; gives up after a while so a
+  // genuinely unsupported browser still leaves the manual field usable.
+  auto poll = new QTimer(&dialog);
+  poll->setInterval(2000);
+  bool browserOpened = false;
+  int attempts = 0;
+  auto attemptLogin = [&, this](QString token, QString validating) {
+    poll->stop();
     clearMedia();
     user_ = {};
     lobby_ = {};
     setProperty("iceReady", false);
     renderLobby();
-    error->setText(tr("Validando sessão…"));
+    error->setText(validating);
     buttons->button(QDialogButtonBox::Ok)->setEnabled(false);
-    server_.login(input->text());
+    server_.login(token);
+  };
+  auto tryBrowserCookie = [&, this, attemptLogin] {
+    auto result = BrowserSession::readCookie(
+        server_.origin().host(), "__Secure-better-auth.session_token");
+    if (!result.value.isEmpty()) {
+      status->setText(tr("Sessão do %1 encontrada.").arg(result.browser));
+      attemptLogin(result.value,
+                  tr("Validando sessão do %1…").arg(result.browser));
+      return;
+    }
+    if (!browserOpened) {
+      browserOpened = true;
+      status->setText(tr(
+          "Não encontramos uma sessão ativa. Vamos abrir o site para você "
+          "entrar — ao concluir o login, esta janela continua sozinha."));
+      QDesktopServices::openUrl(
+          QUrl(server_.origin().toString() + "/apps/compartilhagram"));
+      poll->start();
+    } else if (++attempts >= 30) {
+      poll->stop();
+      status->setText(result.error.isEmpty()
+                          ? tr("Ainda não encontramos sua sessão. Cole o "
+                              "valor manualmente abaixo.")
+                          : result.error);
+    }
+  };
+  connect(poll, &QTimer::timeout, &dialog, tryBrowserCookie);
+  connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+  connect(buttons, &QDialogButtonBox::accepted, &dialog, [&, this, attemptLogin] {
+    if (input->text().isEmpty())
+      return;
+    attemptLogin(input->text(), tr("Validando sessão…"));
     input->clear();
   });
   connect(&server_, &ServerClient::loginFailed, &dialog, [=](QString reason) {
@@ -429,7 +473,9 @@ void MainWindow::promptSession() {
     buttons->button(QDialogButtonBox::Ok)->setEnabled(true);
   });
   connect(&server_, &ServerClient::authenticated, &dialog, &QDialog::accept);
-  dialog.resize(540, 210);
+  if (tryBrowser)
+    QTimer::singleShot(0, &dialog, tryBrowserCookie);
+  dialog.resize(540, 250);
   if (dialog.exec() != QDialog::Accepted && user_.isEmpty()) {
     server_.logout();
     close();
@@ -986,7 +1032,7 @@ void MainWindow::onEvent(QString event, QJsonValue payload) {
     server_.logout();
     user_ = {};
     hide();
-    QTimer::singleShot(0, this, &MainWindow::promptSession);
+    QTimer::singleShot(0, this, [this] { promptSession(false); });
   }
 }
 void MainWindow::publishSfu() {

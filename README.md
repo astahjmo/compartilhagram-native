@@ -9,7 +9,8 @@ Only Compartilhagram is implemented; the other games, pages, and site navigation
 
 The Linux target is **Linux x86_64**. Requirements: a C++20 compiler, CMake 3.24+,
 Qt6 Widgets/Network/DBus/Test development packages, pkg-config, PulseAudio, PipeWire,
-and libyuv development headers (`libpulse-dev libpipewire-0.3-dev libyuv-dev` on Debian).
+libyuv, SQLite3, libsecret, and OpenSSL development headers (`libpulse-dev
+libpipewire-0.3-dev libyuv-dev libsqlite3-dev libsecret-1-dev libssl-dev` on Debian).
 Qt Multimedia and Qt WebSockets are not required.
 
 From the repository root:
@@ -248,8 +249,19 @@ capture/rendering pipeline. Audio remains Opus on the CPU.
 
 ## Session and usage
 
-The first window asks for your **Better Auth session cookie**. Paste either the value
-or `__Secure-better-auth.session_token=value` / `better-auth.session_token=value`.
+On first launch (Linux only), the app silently tries to read the **Better Auth session
+cookie** straight out of your default browser's own profile — no copy-pasting needed if
+you are already logged in there. It supports Gecko-based browsers (Firefox, Zen,
+LibreWolf, Waterfox, Floorp — read directly, the cookie store is not encrypted) and
+Chromium-based ones (Chrome, Chromium, Edge, Brave, Vivaldi, Opera — decrypted using the
+key OSCrypt keeps in the desktop keyring via libsecret). The cookie database is always
+copied to a private temporary file before being read, since the browser holds it open
+while running, and is deleted immediately after. If no session is found this way, the
+window explains that and opens the site for you to log in, then keeps retrying in the
+background so it continues on its own once you're done — no extra click needed.
+
+You can still paste the **Better Auth session cookie** manually instead. Paste either the
+value or `__Secure-better-auth.session_token=value` / `better-auth.session_token=value`.
 Although sometimes called a PHP-session, this server uses Better Auth, not PHPSESSID.
 A bare value uses the secure cookie name required by the production HTTPS origin.
 Paste percent-encoded values unchanged, including a trailing `%3D` if present.
@@ -257,7 +269,8 @@ Paste percent-encoded values unchanged, including a trailing `%3D` if present.
 The app validates `/api/auth/get-session` before opening the lobby. Credentials are
 kept only in memory; no session is embedded in the repository or saved in settings.
 Requests use the production origin, refuse redirects, and preserve TLS certificate verification.
-Use **Trocar sessão** to enter another session.
+Use **Trocar sessão** to enter another session — this always shows the manual dialog
+without retrying the browser lookup, so switching accounts is a deliberate action.
 
 The lobby shows active broadcasters, thumbnails, quality, password protection, and capacity.
 Click a card to join. The viewer provides mute/volume, fullscreen, a floating window,

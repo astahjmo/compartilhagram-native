@@ -13,6 +13,6 @@ int main(int argc, char **argv) {
       "QWidget { font-size: 14px; } QPushButton { padding: 9px; } QGroupBox { "
       "margin-top: 10px; padding-top: 15px; } QLineEdit { padding: 7px; }");
   MainWindow window;
-  QTimer::singleShot(0, &window, &MainWindow::promptSession);
+  QTimer::singleShot(0, &window, [&window] { window.promptSession(true); });
   return app.exec();
 }
