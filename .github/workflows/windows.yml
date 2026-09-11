@@ -19,6 +19,17 @@ jobs:
           New-Item -Path "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting" -Force | Out-Null
           Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting" -Name DontShowUI -Value 1 -Force
           Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting" -Name Disabled -Value 1 -Force
+      # WebRTC's ICE connectivity checks are UDP and unsigned/first-run test
+      # binaries get no chance to be allowed through Windows Defender
+      # Firewall on a headless runner (the "Allow this app?" prompt has
+      # nobody to answer it) — inbound UDP is silently dropped, so ICE
+      # gathers host candidates fine but the connection never reaches
+      # "connected" (confirmed: SDP/ICE candidates exchange correctly, but
+      # PeerConnectionObserver::OnPeerConnectionState never fires at all).
+      # Safe to disable outright: this is a throwaway, isolated CI VM.
+      - name: Disable Windows Defender Firewall
+        shell: pwsh
+        run: Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False
       - name: Set up MSVC environment
         uses: ilammy/msvc-dev-cmd@v1
         with:
